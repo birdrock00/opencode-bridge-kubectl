@@ -35,6 +35,7 @@ RUN apk add --no-cache \
 
 COPY --from=bridge /app /app
 COPY --from=kubectl /opt/bitnami/kubectl/bin/kubectl /usr/local/bin/kubectl
+COPY matrix-bot.js /app/matrix-bot.js
 
 RUN chmod +x /usr/local/bin/kubectl \
     && curl -fsSL https://opencode.ai/install | bash \
@@ -91,6 +92,24 @@ if [ "${START_OPENCODE_SERVER:-true}" = "true" ]; then
 fi
 
 cd /app
+if [ "${CONNECTOR:-}" = "matrix" ] || [ -n "${MATRIX_HOMESERVER:-}" ]; then
+  log "Starting OpenCode API bridge on port ${PORT}"
+  node bridge.js &
+  bridge_pid="$!"
+  trap 'kill "$opencode_pid" "$bridge_pid" 2>/dev/null || true' INT TERM EXIT
+
+  for _ in $(seq 1 60); do
+    if wget -qO- "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      log "OpenCode API bridge is reachable on port ${PORT}"
+      break
+    fi
+    sleep 1
+  done
+
+  log "Starting Matrix connector"
+  exec node matrix-bot.js
+fi
+
 log "Starting OpenCode API bridge on port ${PORT}"
 exec node bridge.js
 EOF
