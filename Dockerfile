@@ -1,5 +1,4 @@
 # syntax=docker/dockerfile:1.7
-#test
 
 FROM node:22-alpine AS bridge
 
