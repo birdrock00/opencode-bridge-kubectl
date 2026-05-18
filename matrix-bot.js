@@ -6,6 +6,12 @@ const MATRIX_DEVICE_ID = process.env.MATRIX_DEVICE_ID || "OPENCODE_BRIDGE_001"
 const MATRIX_SYNC_TIMEOUT_MS = parseInt(process.env.MATRIX_SYNC_TIMEOUT_MS || "30000", 10)
 const MATRIX_TRIGGER = process.env.MATRIX_TRIGGER || "!oc"
 const MATRIX_BOT_NAME = process.env.MATRIX_BOT_NAME || "opencode"
+const MATRIX_ALLOWED_ROOMS = new Set(
+  (process.env.MATRIX_ROOM_ID || process.env.MATRIX_ALLOWED_ROOMS || "")
+    .split(",")
+    .map((room) => room.trim())
+    .filter(Boolean),
+)
 const BRIDGE_URL = (process.env.OPENCODE_BRIDGE_URL || `http://127.0.0.1:${process.env.PORT || "5000"}`).replace(/\/$/, "")
 const CHAT_MODEL = process.env.CHAT_MODEL || process.env.DEFAULT_MODEL || "opencode/gpt-5-nano"
 
@@ -110,6 +116,7 @@ function messageBody(event) {
 
 async function handleTimelineEvent(token, roomId, event, ownUserId) {
   if (event.sender === ownUserId) return
+  if (MATRIX_ALLOWED_ROOMS.size > 0 && !MATRIX_ALLOWED_ROOMS.has(roomId)) return
 
   const body = messageBody(event).trim()
   if (!body.startsWith(MATRIX_TRIGGER)) return
@@ -146,6 +153,7 @@ async function main() {
       since = sync.next_batch || since
 
       for (const roomId of Object.keys(sync.rooms?.invite || {})) {
+        if (MATRIX_ALLOWED_ROOMS.size > 0 && !MATRIX_ALLOWED_ROOMS.has(roomId)) continue
         log(`joining invited room ${roomId}`)
         await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
           method: "POST",
