@@ -71,10 +71,17 @@ async function sendMessage(token, roomId, body) {
   }
 }
 
-async function answerWithOpenCode(prompt) {
+function bridgeConversationId(roomId, event) {
+  return `matrix:${roomId}:${event.event_id || event.origin_server_ts || Date.now()}`
+}
+
+async function answerWithOpenCode(prompt, conversationId) {
   const response = await fetch(`${BRIDGE_URL}/v1/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-conversation-id": conversationId,
+    },
     body: JSON.stringify({
       model: CHAT_MODEL,
       stream: false,
@@ -115,7 +122,7 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
 
   log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
   try {
-    const answer = await answerWithOpenCode(prompt)
+    const answer = await answerWithOpenCode(prompt, bridgeConversationId(roomId, event))
     await sendMessage(token, roomId, answer)
   } catch (error) {
     console.error(error)
