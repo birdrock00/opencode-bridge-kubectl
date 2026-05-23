@@ -1,3 +1,6 @@
+import { request as httpRequest } from "node:http"
+import { request as httpsRequest } from "node:https"
+
 const MATRIX_HOMESERVER = (process.env.MATRIX_HOMESERVER || "").replace(/\/$/, "")
 const MATRIX_USER_ID = process.env.MATRIX_USER_ID || ""
 const MATRIX_PASSWORD = process.env.MATRIX_PASSWORD || ""
@@ -13,9 +16,11 @@ const MATRIX_ALLOWED_ROOMS = new Set(
     .filter(Boolean),
 )
 const BRIDGE_URL = (process.env.OPENCODE_BRIDGE_URL || `http://127.0.0.1:${process.env.PORT || "5000"}`).replace(/\/$/, "")
+const OPENCODE_REQUEST_TIMEOUT_MS = parseInt(process.env.OPENCODE_REQUEST_TIMEOUT_MS || "1860000", 10)
 const CHAT_MODEL = process.env.CHAT_MODEL || process.env.DEFAULT_MODEL || "opencode/gpt-5-nano"
 const CHAT_MODEL_ALIASES = parseModelAliases(process.env.CHAT_MODEL_ALIASES || "")
 const roomModels = new Map()
+const activeRooms = new Set()
 
 function parseModelAliases(value) {
   const aliases = new Map()
@@ -110,8 +115,34 @@ function bridgeConversationId(roomId, event) {
   return `matrix:${roomId}:${event.event_id || event.origin_server_ts || Date.now()}`
 }
 
+function requestBridge(path, options = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${BRIDGE_URL}${path}`)
+    const requestFn = url.protocol === "https:" ? httpsRequest : httpRequest
+    const { body, ...requestOptions } = options
+    const request = requestFn(url, requestOptions, (response) => {
+      let text = ""
+      response.setEncoding("utf8")
+      response.on("data", (chunk) => {
+        text += chunk
+      })
+      response.on("end", () => {
+        const status = response.statusCode || 0
+        resolve({ ok: status >= 200 && status < 300, status, text })
+      })
+    })
+
+    request.setTimeout(OPENCODE_REQUEST_TIMEOUT_MS, () => {
+      request.destroy(new Error(`OpenCode request timed out after ${OPENCODE_REQUEST_TIMEOUT_MS}ms`))
+    })
+    request.on("error", reject)
+    if (body) request.write(body)
+    request.end()
+  })
+}
+
 async function answerWithOpenCode(prompt, conversationId, model) {
-  const response = await fetch(`${BRIDGE_URL}/v1/chat/completions`, {
+  const response = await requestBridge("/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -129,11 +160,10 @@ async function answerWithOpenCode(prompt, conversationId, model) {
     }),
   })
 
-  const text = await response.text()
   if (!response.ok) {
-    throw new Error(`OpenCode bridge failed with HTTP ${response.status}: ${text}`)
+    throw new Error(`OpenCode bridge failed with HTTP ${response.status}: ${response.text}`)
   }
-  const data = JSON.parse(text)
+  const data = JSON.parse(response.text)
   return data.choices?.[0]?.message?.content || "(no response)"
 }
 
@@ -141,6 +171,18 @@ function messageBody(event) {
   if (event?.type !== "m.room.message") return ""
   if (event?.content?.msgtype !== "m.text") return ""
   return event.content.body || ""
+}
+
+async function completeRequest(token, roomId, request, conversationId, model) {
+  try {
+    const answer = await answerWithOpenCode(request, conversationId, model)
+    await sendMessage(token, roomId, answer)
+  } catch (error) {
+    console.error(error)
+    await sendMessage(token, roomId, `OpenCode request failed: ${error.message}`)
+  } finally {
+    activeRooms.delete(roomId)
+  }
 }
 
 async function handleTimelineEvent(token, roomId, event, ownUserId) {
@@ -182,14 +224,21 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
     return
   }
 
-  log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
-  try {
-    const answer = await answerWithOpenCode(request, bridgeConversationId(roomId, event), model)
-    await sendMessage(token, roomId, answer)
-  } catch (error) {
-    console.error(error)
-    await sendMessage(token, roomId, `OpenCode request failed: ${error.message}`)
+  if (activeRooms.has(roomId)) {
+    await sendMessage(token, roomId, "An OpenCode request is already running in this room.")
+    return
   }
+
+  log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
+  activeRooms.add(roomId)
+  try {
+    await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
+  } catch (error) {
+    activeRooms.delete(roomId)
+    throw error
+  }
+  void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model)
+    .catch((error) => console.error(error))
 }
 
 async function main() {
@@ -197,7 +246,8 @@ async function main() {
   const token = await getAccessToken()
   const whoami = await matrixFetch("/_matrix/client/v3/account/whoami", { token })
   const ownUserId = whoami.user_id || MATRIX_USER_ID
-  let since = ""
+  const initialSync = await matrixFetch("/_matrix/client/v3/sync?timeout=0", { token })
+  let since = initialSync.next_batch || ""
 
   log(`listening for ${MATRIX_TRIGGER} as ${ownUserId}`)
   while (true) {
