@@ -14,6 +14,35 @@ const MATRIX_ALLOWED_ROOMS = new Set(
 )
 const BRIDGE_URL = (process.env.OPENCODE_BRIDGE_URL || `http://127.0.0.1:${process.env.PORT || "5000"}`).replace(/\/$/, "")
 const CHAT_MODEL = process.env.CHAT_MODEL || process.env.DEFAULT_MODEL || "opencode/gpt-5-nano"
+const CHAT_MODEL_ALIASES = parseModelAliases(process.env.CHAT_MODEL_ALIASES || "")
+const roomModels = new Map()
+
+function parseModelAliases(value) {
+  const aliases = new Map()
+  for (const item of value.split(",")) {
+    const [alias, ...modelParts] = item.split("=")
+    const model = modelParts.join("=").trim()
+    if (alias?.trim() && model) aliases.set(alias.trim().toLowerCase(), model)
+  }
+  return aliases
+}
+
+function modelList() {
+  const aliases = [...CHAT_MODEL_ALIASES.entries()]
+    .map(([alias, model]) => `${alias}: ${model}`)
+    .join("\n")
+  return [`default: ${CHAT_MODEL}`, aliases].filter(Boolean).join("\n")
+}
+
+function resolveModel(value) {
+  const key = value.trim().toLowerCase()
+  if (!key || key === "default") return CHAT_MODEL
+  return CHAT_MODEL_ALIASES.get(key) || value.trim()
+}
+
+function selectedModel(roomId) {
+  return roomModels.get(roomId) || CHAT_MODEL
+}
 
 function log(message) {
   console.log(`[MATRIX] ${message}`)
@@ -81,7 +110,7 @@ function bridgeConversationId(roomId, event) {
   return `matrix:${roomId}:${event.event_id || event.origin_server_ts || Date.now()}`
 }
 
-async function answerWithOpenCode(prompt, conversationId) {
+async function answerWithOpenCode(prompt, conversationId, model) {
   const response = await fetch(`${BRIDGE_URL}/v1/chat/completions`, {
     method: "POST",
     headers: {
@@ -89,7 +118,7 @@ async function answerWithOpenCode(prompt, conversationId) {
       "x-conversation-id": conversationId,
     },
     body: JSON.stringify({
-      model: CHAT_MODEL,
+      model,
       stream: false,
       messages: [
         {
@@ -123,13 +152,39 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
 
   const prompt = body.slice(MATRIX_TRIGGER.length).trim()
   if (!prompt) {
-    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} <request>`)
+    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} <request>\n${MATRIX_TRIGGER} model <alias|model-id>\n${MATRIX_TRIGGER} using <alias|model-id> <request>`)
+    return
+  }
+
+  const modelCommand = prompt.match(/^model(?:\s+(.+))?$/i)
+  if (modelCommand) {
+    const modelName = (modelCommand[1] || "").trim()
+    if (!modelName) {
+      await sendMessage(token, roomId, `Current model: ${selectedModel(roomId)}\n\nAvailable models:\n${modelList()}`)
+      return
+    }
+    const model = resolveModel(modelName)
+    roomModels.set(roomId, model)
+    await sendMessage(token, roomId, `OpenCode model set to ${model}`)
+    return
+  }
+
+  if (/^models$/i.test(prompt)) {
+    await sendMessage(token, roomId, `Available models:\n${modelList()}`)
+    return
+  }
+
+  const usingCommand = prompt.match(/^using\s+(\S+)\s+([\s\S]+)$/i)
+  const model = usingCommand ? resolveModel(usingCommand[1]) : selectedModel(roomId)
+  const request = usingCommand ? usingCommand[2].trim() : prompt
+  if (!request) {
+    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} using <alias|model-id> <request>`)
     return
   }
 
   log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
   try {
-    const answer = await answerWithOpenCode(prompt, bridgeConversationId(roomId, event))
+    const answer = await answerWithOpenCode(request, bridgeConversationId(roomId, event), model)
     await sendMessage(token, roomId, answer)
   } catch (error) {
     console.error(error)
