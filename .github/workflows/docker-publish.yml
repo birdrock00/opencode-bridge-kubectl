@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -49,3 +49,14 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Create release for daily image
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: image-${{ steps.release-date.outputs.tag }}-${{ github.run_id }}
+          name: Container image ${{ steps.release-date.outputs.tag }}
+          body: |
+            Container image for ${{ steps.release-date.outputs.tag }}:
+
+            `ghcr.io/${{ github.repository }}:${{ steps.release-date.outputs.tag }}`
+          make_latest: true
