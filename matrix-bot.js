@@ -140,6 +140,11 @@ function formatElapsed(elapsedMs) {
   return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`
 }
 
+function formatProgress(text) {
+  if (text.length <= 3100) return text
+  return `${text.slice(0, 1450)}\n\n... live output truncated ...\n\n${text.slice(-1450)}`
+}
+
 function bridgeConversationId(roomId, event) {
   return `matrix:${roomId}:${event.event_id || event.origin_server_ts || Date.now()}`
 }
@@ -170,8 +175,67 @@ function requestBridge(path, options = {}) {
   })
 }
 
-async function answerWithOpenCode(prompt, conversationId, model) {
-  const response = await requestBridge("/v1/chat/completions", {
+function requestBridgeStream(path, options = {}, onProgress) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${BRIDGE_URL}${path}`)
+    const requestFn = url.protocol === "https:" ? httpsRequest : httpRequest
+    const { body, ...requestOptions } = options
+    const request = requestFn(url, requestOptions, (response) => {
+      const status = response.statusCode || 0
+      let raw = ""
+      let buffer = ""
+      let answer = ""
+      let streamError = ""
+
+      response.setEncoding("utf8")
+      response.on("data", (chunk) => {
+        if (status < 200 || status >= 300) {
+          raw += chunk
+          return
+        }
+        buffer += chunk
+        const blocks = buffer.split(/\r?\n\r?\n/)
+        buffer = blocks.pop() || ""
+        for (const block of blocks) {
+          const lines = block.split(/\r?\n/)
+          const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message"
+          const dataText = lines
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trimStart())
+            .join("\n")
+          if (!dataText || dataText === "[DONE]") continue
+          const data = JSON.parse(dataText)
+          if (event === "progress") {
+            onProgress(data.text || "")
+          } else if (data.error) {
+            streamError = data.error.message || "OpenCode bridge stream failed"
+          } else {
+            answer += data.choices?.[0]?.delta?.content || ""
+          }
+        }
+      })
+      response.on("end", () => {
+        if (status < 200 || status >= 300) {
+          resolve({ ok: false, status, text: raw })
+        } else if (streamError) {
+          reject(new Error(streamError))
+        } else {
+          resolve({ ok: true, status, text: answer || "(no response)" })
+        }
+      })
+    })
+
+    request.setTimeout(OPENCODE_REQUEST_TIMEOUT_MS, () => {
+      request.destroy(new Error(`OpenCode request timed out after ${OPENCODE_REQUEST_TIMEOUT_MS}ms`))
+    })
+    request.on("error", reject)
+    if (body) request.write(body)
+    request.end()
+  })
+}
+
+async function answerWithOpenCode(prompt, conversationId, model, onProgress) {
+  const response = await requestBridgeStream("/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -179,7 +243,7 @@ async function answerWithOpenCode(prompt, conversationId, model) {
     },
     body: JSON.stringify({
       model,
-      stream: false,
+      stream: true,
       messages: [
         {
           role: "user",
@@ -187,13 +251,12 @@ async function answerWithOpenCode(prompt, conversationId, model) {
         },
       ],
     }),
-  })
+  }, onProgress)
 
   if (!response.ok) {
     throw new Error(`OpenCode bridge failed with HTTP ${response.status}: ${response.text}`)
   }
-  const data = JSON.parse(response.text)
-  return data.choices?.[0]?.message?.content || "(no response)"
+  return response.text
 }
 
 function messageBody(event) {
@@ -204,6 +267,7 @@ function messageBody(event) {
 
 async function completeRequest(token, roomId, request, conversationId, model, statusEventId) {
   const startedAt = Date.now()
+  let progressEventId = ""
   let progressUpdate = Promise.resolve()
   const progress = setInterval(() => {
     progressUpdate = progressUpdate
@@ -217,7 +281,18 @@ async function completeRequest(token, roomId, request, conversationId, model, st
   }, MATRIX_PROGRESS_INTERVAL_MS)
 
   try {
-    const answer = await answerWithOpenCode(request, conversationId, model)
+    const answer = await answerWithOpenCode(request, conversationId, model, (text) => {
+      progressUpdate = progressUpdate
+        .then(async () => {
+          const body = `Live output (${formatElapsed(Date.now() - startedAt)} elapsed):\n${formatProgress(text)}`
+          if (progressEventId) {
+            await replaceMessage(token, roomId, progressEventId, body)
+          } else {
+            progressEventId = await sendMessage(token, roomId, body)
+          }
+        })
+        .catch((error) => console.error(error))
+    })
     clearInterval(progress)
     await progressUpdate
     await replaceMessage(token, roomId, statusEventId, `Completed ${model} after ${formatElapsed(Date.now() - startedAt)}. Posting result.`)

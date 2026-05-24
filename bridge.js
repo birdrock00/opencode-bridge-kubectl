@@ -26,6 +26,7 @@ const LOG_LEVEL     = process.env.LOG_LEVEL                     || "info"
 const LOG_FILE      = process.env.LOG_FILE                      || ""           // e.g. /data/logs/bridge.log
 const TIMEOUT_MS    = parseInt(process.env.TIMEOUT_MS           || "600000",   10)
 const HEARTBEAT_MS  = parseInt(process.env.HEARTBEAT_MS         || "15000",    10)
+const PROGRESS_POLL_MS = parseInt(process.env.PROGRESS_POLL_MS  || "3000",     10)
 const RETRY_COUNT   = parseInt(process.env.RETRY_COUNT          || "2",        10)
 const RETRY_DELAY   = parseInt(process.env.RETRY_DELAY_MS       || "2000",     10)
 const SESSION_TTL_H = parseInt(process.env.SESSION_TTL_HOURS    || "2",        10)
@@ -303,6 +304,29 @@ function buildParts(messages, tools) {
   return { parts, hasImg }
 }
 
+function progressSnapshot(messages) {
+  const segments = []
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message.info?.role !== "assistant") continue
+    for (const part of message.parts ?? []) {
+      if (part.type === "text" && part.text?.trim()) {
+        segments.push(part.text.trim())
+        continue
+      }
+      if (part.type !== "tool") continue
+      const state = part.state ?? {}
+      const title = state.title ?? part.tool ?? "tool"
+      const status = state.status ?? "running"
+      const output = typeof state.output === "string" ? state.output.trim() : ""
+      segments.push([`[tool ${status}] ${title}`, output].filter(Boolean).join("\n"))
+    }
+  }
+
+  const text = segments.join("\n\n")
+  if (text.length <= 3000) return text
+  return `${text.slice(0, 1400)}\n\n... live output truncated ...\n\n${text.slice(-1400)}`
+}
+
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 
 function authMiddleware(req, res, next) {
@@ -430,12 +454,31 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
 
     // 3. Start SSE heartbeat before the slow OpenCode call
     let heartbeat = null
+    let progressPoll = null
+    let progressPending = false
+    let lastProgress = ""
+    const emitProgress = async () => {
+      if (!stream || progressPending) return
+      progressPending = true
+      try {
+        const messages = await ocGet(`/session/${encodeURIComponent(sessionId)}/message`, 10000)
+        const text = progressSnapshot(messages)
+        if (!text || text === lastProgress) return
+        lastProgress = text
+        res.write(`event: progress\ndata: ${JSON.stringify({ session_id: sessionId, text })}\n\n`)
+      } catch (err) {
+        logger.debug(`[${reqId}] unable to read live progress: ${err.message}`)
+      } finally {
+        progressPending = false
+      }
+    }
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream")
       res.setHeader("Cache-Control", "no-cache")
       res.setHeader("Connection", "keep-alive")
       res.flushHeaders()
       heartbeat = setInterval(() => res.write(": heartbeat\n\n"), HEARTBEAT_MS)
+      progressPoll = setInterval(() => void emitProgress(), PROGRESS_POLL_MS)
     }
 
     // 4. Send to OpenCode (with retry)
@@ -447,7 +490,9 @@ app.post("/v1/chat/completions", authMiddleware, async (req, res) => {
       }))
     } finally {
       if (heartbeat) clearInterval(heartbeat)
+      if (progressPoll) clearInterval(progressPoll)
     }
+    await emitProgress()
 
     // 5. Extract response — join ALL text parts in order (OpenCode may produce
     //    multiple text parts across tool-use steps)
@@ -576,6 +621,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   logger.info(`  OC Auth    : ${OPENCODE_PASS ? `enabled (user=${OPENCODE_USER})` : "disabled"}`)
   logger.info(`  Timeout    : ${TIMEOUT_MS}ms`)
   logger.info(`  Heartbeat  : ${HEARTBEAT_MS}ms`)
+  logger.info(`  Progress   : poll every ${PROGRESS_POLL_MS}ms for streaming requests`)
   logger.info(`  Retries    : ${RETRY_COUNT} × ${RETRY_DELAY}ms delay`)
   logger.info(`  Sessions   : cleanup every ${CLEANUP_EVERY / 60000}min, TTL ${SESSION_TTL_H}h`)
   logger.info(`  Log file   : ${LOG_FILE || "stdout only"}`)
