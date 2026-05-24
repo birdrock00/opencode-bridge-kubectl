@@ -21,7 +21,6 @@ const OPENCODE_REQUEST_TIMEOUT_MS = parseInt(process.env.OPENCODE_REQUEST_TIMEOU
 const CHAT_MODEL = process.env.CHAT_MODEL || process.env.DEFAULT_MODEL || "opencode/gpt-5-nano"
 const CHAT_MODEL_ALIASES = parseModelAliases(process.env.CHAT_MODEL_ALIASES || "")
 const roomModels = new Map()
-const activeRooms = new Set()
 
 function parseModelAliases(value) {
   const aliases = new Map()
@@ -307,7 +306,6 @@ async function completeRequest(token, roomId, request, conversationId, model, st
     await sendMessage(token, roomId, `OpenCode request failed: ${error.message}`)
   } finally {
     clearInterval(progress)
-    activeRooms.delete(roomId)
   }
 }
 
@@ -350,20 +348,9 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
     return
   }
 
-  if (activeRooms.has(roomId)) {
-    await sendMessage(token, roomId, "An OpenCode request is already running in this room.")
-    return
-  }
-
   log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
-  activeRooms.add(roomId)
   let statusEventId
-  try {
-    statusEventId = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
-  } catch (error) {
-    activeRooms.delete(roomId)
-    throw error
-  }
+  statusEventId = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
   void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model, statusEventId)
     .catch((error) => console.error(error))
 }
