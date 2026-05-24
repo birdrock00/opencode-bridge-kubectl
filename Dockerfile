@@ -26,6 +26,7 @@ ENV PORT=5000 \
 WORKDIR /app
 
 RUN apk add --no-cache \
+      ansible \
       bash \
       ca-certificates \
       curl \
@@ -39,6 +40,8 @@ COPY bridge.js /app/bridge.js
 COPY matrix-bot.js /app/matrix-bot.js
 
 RUN chmod +x /usr/local/bin/kubectl \
+    && ansible-playbook --version \
+    && ansible-vault --version \
     && curl -fsSL https://opencode.ai/install | bash \
     && mkdir -p /workspace /data
 
