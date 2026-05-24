@@ -53,6 +53,10 @@ function log(message) {
   console.log(`[MATRIX] ${message}`)
 }
 
+function logError(message) {
+  console.error(`[MATRIX] ${message}`)
+}
+
 function requireEnv(name, value) {
   if (!value) {
     throw new Error(`${name} is required for Matrix connector`)
@@ -92,7 +96,7 @@ async function getAccessToken() {
       initial_device_display_name: MATRIX_BOT_NAME,
     }),
   })
-  log(`logged in as ${data.user_id}`)
+  log("authenticated with Matrix")
   return data.access_token
 }
 
@@ -276,7 +280,7 @@ async function completeRequest(token, roomId, request, conversationId, model, st
         statusEventId,
         `Running ${model}; ${formatElapsed(Date.now() - startedAt)} elapsed. I will post the result when it finishes.`,
       ))
-      .catch((error) => console.error(error))
+      .catch(() => logError("failed to update progress status"))
   }, MATRIX_PROGRESS_INTERVAL_MS)
 
   try {
@@ -290,20 +294,20 @@ async function completeRequest(token, roomId, request, conversationId, model, st
             progressEventId = await sendMessage(token, roomId, body)
           }
         })
-        .catch((error) => console.error(error))
+        .catch(() => logError("failed to publish live progress"))
     })
     clearInterval(progress)
     await progressUpdate
     await replaceMessage(token, roomId, statusEventId, `Completed ${model} after ${formatElapsed(Date.now() - startedAt)}. Posting result.`)
-      .catch((error) => console.error(error))
+      .catch(() => logError("failed to update completion status"))
     await sendMessage(token, roomId, answer)
-  } catch (error) {
-    console.error(error)
+  } catch {
+    logError("OpenCode request failed")
     clearInterval(progress)
     await progressUpdate
     await replaceMessage(token, roomId, statusEventId, `Failed ${model} after ${formatElapsed(Date.now() - startedAt)}.`)
-      .catch((editError) => console.error(editError))
-    await sendMessage(token, roomId, `OpenCode request failed: ${error.message}`)
+      .catch(() => logError("failed to update failure status"))
+    await sendMessage(token, roomId, "OpenCode request failed.")
   } finally {
     clearInterval(progress)
   }
@@ -348,11 +352,11 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
     return
   }
 
-  log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
+  log("handling Matrix request")
   let statusEventId
   statusEventId = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
   void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model, statusEventId)
-    .catch((error) => console.error(error))
+    .catch(() => logError("background Matrix request failed"))
 }
 
 async function main() {
@@ -363,7 +367,7 @@ async function main() {
   const initialSync = await matrixFetch("/_matrix/client/v3/sync?timeout=0", { token })
   let since = initialSync.next_batch || ""
 
-  log(`listening for ${MATRIX_TRIGGER} as ${ownUserId}`)
+  log("listening for Matrix requests")
   while (true) {
     try {
       const query = new URLSearchParams({ timeout: String(MATRIX_SYNC_TIMEOUT_MS) })
@@ -373,7 +377,7 @@ async function main() {
 
       for (const roomId of Object.keys(sync.rooms?.invite || {})) {
         if (MATRIX_ALLOWED_ROOMS.size > 0 && !MATRIX_ALLOWED_ROOMS.has(roomId)) continue
-        log(`joining invited room ${roomId}`)
+        log("joining invited Matrix room")
         await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/join`, {
           method: "POST",
           token,
@@ -386,14 +390,14 @@ async function main() {
           await handleTimelineEvent(token, roomId, event, ownUserId)
         }
       }
-    } catch (error) {
-      console.error(error)
+    } catch {
+      logError("Matrix sync failed; retrying")
       await new Promise((resolve) => setTimeout(resolve, 5000))
     }
   }
 }
 
-main().catch((error) => {
-  console.error(error)
+main().catch(() => {
+  logError("Matrix connector terminated")
   process.exit(1)
 })
