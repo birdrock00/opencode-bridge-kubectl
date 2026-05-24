@@ -35,6 +35,7 @@ RUN apk add --no-cache \
 
 COPY --from=bridge /app /app
 COPY --from=kubectl /opt/bitnami/kubectl/bin/kubectl /usr/local/bin/kubectl
+COPY bridge.js /app/bridge.js
 COPY matrix-bot.js /app/matrix-bot.js
 
 RUN chmod +x /usr/local/bin/kubectl \
