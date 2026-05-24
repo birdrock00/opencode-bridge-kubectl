@@ -7,6 +7,7 @@ const MATRIX_PASSWORD = process.env.MATRIX_PASSWORD || ""
 const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN || ""
 const MATRIX_DEVICE_ID = process.env.MATRIX_DEVICE_ID || "OPENCODE_BRIDGE_001"
 const MATRIX_SYNC_TIMEOUT_MS = parseInt(process.env.MATRIX_SYNC_TIMEOUT_MS || "30000", 10)
+const MATRIX_PROGRESS_INTERVAL_MS = parseInt(process.env.MATRIX_PROGRESS_INTERVAL_MS || "60000", 10)
 const MATRIX_TRIGGER = process.env.MATRIX_TRIGGER || "!oc"
 const MATRIX_BOT_NAME = process.env.MATRIX_BOT_NAME || "opencode"
 const MATRIX_ALLOWED_ROOMS = new Set(
@@ -98,9 +99,10 @@ async function getAccessToken() {
 
 async function sendMessage(token, roomId, body) {
   const chunks = body.match(/[\s\S]{1,3500}/g) || [body]
+  let firstEventId = ""
   for (const chunk of chunks) {
     const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
-    await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
+    const event = await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
       method: "PUT",
       token,
       body: JSON.stringify({
@@ -108,7 +110,34 @@ async function sendMessage(token, roomId, body) {
         body: chunk,
       }),
     })
+    firstEventId ||= event.event_id || ""
   }
+  return firstEventId
+}
+
+async function replaceMessage(token, roomId, eventId, body) {
+  if (!eventId) {
+    await sendMessage(token, roomId, body)
+    return
+  }
+
+  const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
+    method: "PUT",
+    token,
+    body: JSON.stringify({
+      msgtype: "m.text",
+      body: `* ${body}`,
+      "m.new_content": { msgtype: "m.text", body },
+      "m.relates_to": { rel_type: "m.replace", event_id: eventId },
+    }),
+  })
+}
+
+function formatElapsed(elapsedMs) {
+  const seconds = Math.floor(elapsedMs / 1000)
+  const minutes = Math.floor(seconds / 60)
+  return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`
 }
 
 function bridgeConversationId(roomId, event) {
@@ -173,14 +202,36 @@ function messageBody(event) {
   return event.content.body || ""
 }
 
-async function completeRequest(token, roomId, request, conversationId, model) {
+async function completeRequest(token, roomId, request, conversationId, model, statusEventId) {
+  const startedAt = Date.now()
+  let progressUpdate = Promise.resolve()
+  const progress = setInterval(() => {
+    progressUpdate = progressUpdate
+      .then(() => replaceMessage(
+        token,
+        roomId,
+        statusEventId,
+        `Running ${model}; ${formatElapsed(Date.now() - startedAt)} elapsed. I will post the result when it finishes.`,
+      ))
+      .catch((error) => console.error(error))
+  }, MATRIX_PROGRESS_INTERVAL_MS)
+
   try {
     const answer = await answerWithOpenCode(request, conversationId, model)
+    clearInterval(progress)
+    await progressUpdate
+    await replaceMessage(token, roomId, statusEventId, `Completed ${model} after ${formatElapsed(Date.now() - startedAt)}. Posting result.`)
+      .catch((error) => console.error(error))
     await sendMessage(token, roomId, answer)
   } catch (error) {
     console.error(error)
+    clearInterval(progress)
+    await progressUpdate
+    await replaceMessage(token, roomId, statusEventId, `Failed ${model} after ${formatElapsed(Date.now() - startedAt)}.`)
+      .catch((editError) => console.error(editError))
     await sendMessage(token, roomId, `OpenCode request failed: ${error.message}`)
   } finally {
+    clearInterval(progress)
     activeRooms.delete(roomId)
   }
 }
@@ -231,13 +282,14 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
 
   log(`handling ${MATRIX_TRIGGER} request in ${roomId} from ${event.sender}`)
   activeRooms.add(roomId)
+  let statusEventId
   try {
-    await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
+    statusEventId = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
   } catch (error) {
     activeRooms.delete(roomId)
     throw error
   }
-  void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model)
+  void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model, statusEventId)
     .catch((error) => console.error(error))
 }
 
