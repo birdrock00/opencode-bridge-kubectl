@@ -385,12 +385,16 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
 
   const prompt = startsThread ? body.slice(MATRIX_TRIGGER.length).trim() : body
   const key = threadKey(roomId, rootId)
+  const controlPrompt = startsThread
+    ? prompt
+    : (isTriggerMessage(body) ? body.slice(MATRIX_TRIGGER.length).trim() : "")
+  const isControlMessage = startsThread || isTriggerMessage(body)
   if (!prompt) {
-    await sendMessage(token, roomId, "Started a new OpenCode conversation. Reply in this thread with the first request.", rootId, event.event_id)
+    await sendMessage(token, roomId, `Started a new OpenCode conversation. Reply in this thread with the first request, or use ${MATRIX_TRIGGER} model <alias> to select a model.`, rootId, event.event_id)
     return
   }
 
-  const modelCommand = startsThread && prompt.match(/^model(?:\s+(.+))?$/i)
+  const modelCommand = isControlMessage && controlPrompt.match(/^model(?:\s+(.+))?$/i)
   if (modelCommand) {
     const modelName = (modelCommand[1] || "").trim()
     if (!modelName) {
@@ -403,12 +407,12 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
     return
   }
 
-  if (startsThread && /^models$/i.test(prompt)) {
+  if (isControlMessage && /^models$/i.test(controlPrompt)) {
     await sendMessage(token, roomId, `Available models:\n${modelList()}`, rootId, event.event_id)
     return
   }
 
-  const usingCommand = startsThread && prompt.match(/^using\s+(\S+)\s+([\s\S]+)$/i)
+  const usingCommand = isControlMessage && controlPrompt.match(/^using\s+(\S+)\s+([\s\S]+)$/i)
   const model = usingCommand ? resolveModel(usingCommand[1]) : selectedModel(key)
   const request = usingCommand ? usingCommand[2].trim() : prompt
   if (!request) {
