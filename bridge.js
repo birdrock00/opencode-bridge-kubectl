@@ -40,6 +40,7 @@ const sessionMap = new Map() // conversationId → { sessionId, lastUsed }
 const SESSION_MAP_TTL = SESSION_TTL_H * 60 * 60 * 1000
 
 function pruneSessionMap() {
+  if (SESSION_TTL_H <= 0) return
   const cutoff = Date.now() - SESSION_MAP_TTL
   for (const [k, v] of sessionMap.entries()) {
     if (v.lastUsed < cutoff) sessionMap.delete(k)
@@ -72,7 +73,7 @@ const logger = {
 
 function withTimeout(ms) {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), ms)
+  const timer = ms > 0 ? setTimeout(() => controller.abort(), ms) : null
   return { signal: controller.signal, clear: () => clearTimeout(timer) }
 }
 
@@ -108,11 +109,13 @@ function ocRequest(path, options = {}, timeoutMs = TIMEOUT_MS) {
       })
     })
 
-    request.setTimeout(timeoutMs, () => {
-      const error = new Error(`OpenCode ${options.method ?? "GET"} ${path} timed out after ${timeoutMs}ms`)
-      error.name = "AbortError"
-      request.destroy(error)
-    })
+    if (timeoutMs > 0) {
+      request.setTimeout(timeoutMs, () => {
+        const error = new Error(`OpenCode ${options.method ?? "GET"} ${path} timed out after ${timeoutMs}ms`)
+        error.name = "AbortError"
+        request.destroy(error)
+      })
+    }
     request.on("error", reject)
     if (body) request.write(body)
     request.end()
@@ -177,6 +180,7 @@ async function withRetry(fn, retries = RETRY_COUNT, delayMs = RETRY_DELAY) {
 // ─── Session cleanup ──────────────────────────────────────────────────────────
 
 async function cleanupOldSessions() {
+  if (SESSION_TTL_H <= 0) return
   try {
     const data     = await ocGetList("/session")
     const sessions = Array.isArray(data) ? data : (data.sessions ?? data.data ?? [])
