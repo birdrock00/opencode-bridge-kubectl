@@ -17,10 +17,12 @@ const MATRIX_ALLOWED_ROOMS = new Set(
     .filter(Boolean),
 )
 const BRIDGE_URL = (process.env.OPENCODE_BRIDGE_URL || `http://127.0.0.1:${process.env.PORT || "5000"}`).replace(/\/$/, "")
-const OPENCODE_REQUEST_TIMEOUT_MS = parseInt(process.env.OPENCODE_REQUEST_TIMEOUT_MS || "1860000", 10)
+const OPENCODE_REQUEST_TIMEOUT_MS = parseInt(process.env.OPENCODE_REQUEST_TIMEOUT_MS || "0", 10)
 const CHAT_MODEL = process.env.CHAT_MODEL || process.env.DEFAULT_MODEL || "opencode/gpt-5-nano"
 const CHAT_MODEL_ALIASES = parseModelAliases(process.env.CHAT_MODEL_ALIASES || "")
-const roomModels = new Map()
+const threadModels = new Map()
+const threadQueues = new Map()
+const activeThreads = new Set()
 
 function parseModelAliases(value) {
   const aliases = new Map()
@@ -45,8 +47,8 @@ function resolveModel(value) {
   return CHAT_MODEL_ALIASES.get(key) || value.trim()
 }
 
-function selectedModel(roomId) {
-  return roomModels.get(roomId) || CHAT_MODEL
+function selectedModel(threadId) {
+  return threadModels.get(threadId) || CHAT_MODEL
 }
 
 function log(message) {
@@ -100,27 +102,36 @@ async function getAccessToken() {
   return data.access_token
 }
 
-async function sendMessage(token, roomId, body) {
+async function sendMessage(token, roomId, body, threadRootId = "", replyToEventId = "") {
   const chunks = body.match(/[\s\S]{1,3500}/g) || [body]
   let firstEventId = ""
   for (const chunk of chunks) {
     const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const content = {
+      msgtype: "m.text",
+      body: chunk,
+    }
+    if (threadRootId) {
+      content["m.relates_to"] = {
+        rel_type: "m.thread",
+        event_id: threadRootId,
+        is_falling_back: true,
+        "m.in_reply_to": { event_id: replyToEventId || threadRootId },
+      }
+    }
     const event = await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
       method: "PUT",
       token,
-      body: JSON.stringify({
-        msgtype: "m.text",
-        body: chunk,
-      }),
+      body: JSON.stringify(content),
     })
     firstEventId ||= event.event_id || ""
   }
   return firstEventId
 }
 
-async function replaceMessage(token, roomId, eventId, body) {
+async function replaceMessage(token, roomId, eventId, body, threadRootId = "", replyToEventId = "") {
   if (!eventId) {
-    await sendMessage(token, roomId, body)
+    await sendMessage(token, roomId, body, threadRootId, replyToEventId)
     return
   }
 
@@ -148,8 +159,12 @@ function formatProgress(text) {
   return `${text.slice(0, 1450)}\n\n... live output truncated ...\n\n${text.slice(-1450)}`
 }
 
-function bridgeConversationId(roomId, event) {
-  return `matrix:${roomId}:${event.event_id || event.origin_server_ts || Date.now()}`
+function threadKey(roomId, rootId) {
+  return `${roomId}:${rootId}`
+}
+
+function bridgeConversationId(roomId, rootId) {
+  return `matrix:${threadKey(roomId, rootId)}`
 }
 
 function requestBridge(path, options = {}) {
@@ -169,9 +184,11 @@ function requestBridge(path, options = {}) {
       })
     })
 
-    request.setTimeout(OPENCODE_REQUEST_TIMEOUT_MS, () => {
-      request.destroy(new Error(`OpenCode request timed out after ${OPENCODE_REQUEST_TIMEOUT_MS}ms`))
-    })
+    if (OPENCODE_REQUEST_TIMEOUT_MS > 0) {
+      request.setTimeout(OPENCODE_REQUEST_TIMEOUT_MS, () => {
+        request.destroy(new Error(`OpenCode request timed out after ${OPENCODE_REQUEST_TIMEOUT_MS}ms`))
+      })
+    }
     request.on("error", reject)
     if (body) request.write(body)
     request.end()
@@ -228,9 +245,11 @@ function requestBridgeStream(path, options = {}, onProgress) {
       })
     })
 
-    request.setTimeout(OPENCODE_REQUEST_TIMEOUT_MS, () => {
-      request.destroy(new Error(`OpenCode request timed out after ${OPENCODE_REQUEST_TIMEOUT_MS}ms`))
-    })
+    if (OPENCODE_REQUEST_TIMEOUT_MS > 0) {
+      request.setTimeout(OPENCODE_REQUEST_TIMEOUT_MS, () => {
+        request.destroy(new Error(`OpenCode request timed out after ${OPENCODE_REQUEST_TIMEOUT_MS}ms`))
+      })
+    }
     request.on("error", reject)
     if (body) request.write(body)
     request.end()
@@ -268,7 +287,40 @@ function messageBody(event) {
   return event.content.body || ""
 }
 
-async function completeRequest(token, roomId, request, conversationId, model, statusEventId) {
+function threadRootId(event) {
+  const relation = event?.content?.["m.relates_to"]
+  return relation?.rel_type === "m.thread" ? relation.event_id || "" : ""
+}
+
+function isTriggerMessage(body) {
+  return body === MATRIX_TRIGGER || body.startsWith(`${MATRIX_TRIGGER} `)
+}
+
+async function isActiveThread(token, roomId, rootId) {
+  const key = threadKey(roomId, rootId)
+  if (activeThreads.has(key)) return true
+  try {
+    const root = await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(rootId)}`, { token })
+    if (isTriggerMessage(messageBody(root).trim())) {
+      activeThreads.add(key)
+      return true
+    }
+  } catch {
+    logError("failed to load Matrix thread root")
+  }
+  return false
+}
+
+function enqueueThreadTask(key, task) {
+  const previous = threadQueues.get(key) || Promise.resolve()
+  const next = previous.then(task, task).finally(() => {
+    if (threadQueues.get(key) === next) threadQueues.delete(key)
+  })
+  threadQueues.set(key, next)
+  return next
+}
+
+async function completeRequest(token, roomId, request, conversationId, model, statusEventId, rootId, replyToEventId) {
   const startedAt = Date.now()
   let progressEventId = ""
   let progressUpdate = Promise.resolve()
@@ -279,6 +331,8 @@ async function completeRequest(token, roomId, request, conversationId, model, st
         roomId,
         statusEventId,
         `Running ${model}; ${formatElapsed(Date.now() - startedAt)} elapsed. I will post the result when it finishes.`,
+        rootId,
+        replyToEventId,
       ))
       .catch(() => logError("failed to update progress status"))
   }, MATRIX_PROGRESS_INTERVAL_MS)
@@ -289,25 +343,25 @@ async function completeRequest(token, roomId, request, conversationId, model, st
         .then(async () => {
           const body = `Live output (${formatElapsed(Date.now() - startedAt)} elapsed):\n${formatProgress(text)}`
           if (progressEventId) {
-            await replaceMessage(token, roomId, progressEventId, body)
+            await replaceMessage(token, roomId, progressEventId, body, rootId, replyToEventId)
           } else {
-            progressEventId = await sendMessage(token, roomId, body)
+            progressEventId = await sendMessage(token, roomId, body, rootId, replyToEventId)
           }
         })
         .catch(() => logError("failed to publish live progress"))
     })
     clearInterval(progress)
     await progressUpdate
-    await replaceMessage(token, roomId, statusEventId, `Completed ${model} after ${formatElapsed(Date.now() - startedAt)}. Posting result.`)
+    await replaceMessage(token, roomId, statusEventId, `Completed ${model} after ${formatElapsed(Date.now() - startedAt)}. Posting result.`, rootId, replyToEventId)
       .catch(() => logError("failed to update completion status"))
-    await sendMessage(token, roomId, answer)
+    await sendMessage(token, roomId, answer, rootId, replyToEventId)
   } catch {
     logError("OpenCode request failed")
     clearInterval(progress)
     await progressUpdate
-    await replaceMessage(token, roomId, statusEventId, `Failed ${model} after ${formatElapsed(Date.now() - startedAt)}.`)
+    await replaceMessage(token, roomId, statusEventId, `Failed ${model} after ${formatElapsed(Date.now() - startedAt)}.`, rootId, replyToEventId)
       .catch(() => logError("failed to update failure status"))
-    await sendMessage(token, roomId, "OpenCode request failed.")
+    await sendMessage(token, roomId, "OpenCode request failed.", rootId, replyToEventId)
   } finally {
     clearInterval(progress)
   }
@@ -318,44 +372,55 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
   if (MATRIX_ALLOWED_ROOMS.size > 0 && !MATRIX_ALLOWED_ROOMS.has(roomId)) return
 
   const body = messageBody(event).trim()
-  if (!body.startsWith(MATRIX_TRIGGER)) return
+  if (!body) return
 
-  const prompt = body.slice(MATRIX_TRIGGER.length).trim()
+  let rootId = threadRootId(event)
+  const startsThread = !rootId && isTriggerMessage(body)
+  if (!startsThread && (!rootId || !(await isActiveThread(token, roomId, rootId)))) return
+  if (startsThread) {
+    rootId = event.event_id
+    if (!rootId) return
+    activeThreads.add(threadKey(roomId, rootId))
+  }
+
+  const prompt = startsThread ? body.slice(MATRIX_TRIGGER.length).trim() : body
+  const key = threadKey(roomId, rootId)
   if (!prompt) {
-    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} <request>\n${MATRIX_TRIGGER} model <alias|model-id>\n${MATRIX_TRIGGER} using <alias|model-id> <request>`)
+    await sendMessage(token, roomId, "Started a new OpenCode conversation. Reply in this thread with the first request.", rootId, event.event_id)
     return
   }
 
-  const modelCommand = prompt.match(/^model(?:\s+(.+))?$/i)
+  const modelCommand = startsThread && prompt.match(/^model(?:\s+(.+))?$/i)
   if (modelCommand) {
     const modelName = (modelCommand[1] || "").trim()
     if (!modelName) {
-      await sendMessage(token, roomId, `Current model: ${selectedModel(roomId)}\n\nAvailable models:\n${modelList()}`)
+      await sendMessage(token, roomId, `Current model: ${selectedModel(key)}\n\nAvailable models:\n${modelList()}`, rootId, event.event_id)
       return
     }
     const model = resolveModel(modelName)
-    roomModels.set(roomId, model)
-    await sendMessage(token, roomId, `OpenCode model set to ${model}`)
+    threadModels.set(key, model)
+    await sendMessage(token, roomId, `OpenCode model set to ${model}. Reply in this thread with a request.`, rootId, event.event_id)
     return
   }
 
-  if (/^models$/i.test(prompt)) {
-    await sendMessage(token, roomId, `Available models:\n${modelList()}`)
+  if (startsThread && /^models$/i.test(prompt)) {
+    await sendMessage(token, roomId, `Available models:\n${modelList()}`, rootId, event.event_id)
     return
   }
 
-  const usingCommand = prompt.match(/^using\s+(\S+)\s+([\s\S]+)$/i)
-  const model = usingCommand ? resolveModel(usingCommand[1]) : selectedModel(roomId)
+  const usingCommand = startsThread && prompt.match(/^using\s+(\S+)\s+([\s\S]+)$/i)
+  const model = usingCommand ? resolveModel(usingCommand[1]) : selectedModel(key)
   const request = usingCommand ? usingCommand[2].trim() : prompt
   if (!request) {
-    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} using <alias|model-id> <request>`)
+    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} using <alias|model-id> <request>`, rootId, event.event_id)
     return
   }
 
   log("handling Matrix request")
-  let statusEventId
-  statusEventId = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
-  void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model, statusEventId)
+  void enqueueThreadTask(key, async () => {
+    const statusEventId = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`, rootId, event.event_id)
+    await completeRequest(token, roomId, request, bridgeConversationId(roomId, rootId), model, statusEventId, rootId, event.event_id)
+  })
     .catch(() => logError("background Matrix request failed"))
 }
 
