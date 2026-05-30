@@ -270,7 +270,6 @@ function messageBody(event) {
 
 async function completeRequest(token, roomId, request, conversationId, model, statusEventId) {
   const startedAt = Date.now()
-  let progressEventId = ""
   let progressUpdate = Promise.resolve()
   const progress = setInterval(() => {
     progressUpdate = progressUpdate
@@ -288,11 +287,7 @@ async function completeRequest(token, roomId, request, conversationId, model, st
       progressUpdate = progressUpdate
         .then(async () => {
           const body = `Live output (${formatElapsed(Date.now() - startedAt)} elapsed):\n${formatProgress(text)}`
-          if (progressEventId) {
-            await replaceMessage(token, roomId, progressEventId, body)
-          } else {
-            progressEventId = await sendMessage(token, roomId, body)
-          }
+          await sendMessage(token, roomId, body)
         })
         .catch(() => logError("failed to publish live progress"))
     })
