@@ -88,7 +88,7 @@ if [ "${START_OPENCODE_SERVER:-true}" = "true" ]; then
   trap 'kill "$opencode_pid" 2>/dev/null || true' INT TERM EXIT
 
   for _ in $(seq 1 60); do
-    if wget -qO- "$OPENCODE_URL" >/dev/null 2>&1; then
+    if wget -T 5 -t 1 -qO- "$OPENCODE_URL" >/dev/null 2>&1; then
       log "OpenCode server is reachable at $OPENCODE_URL"
       break
     fi
@@ -104,7 +104,7 @@ if [ "${CONNECTOR:-}" = "matrix" ] || [ -n "${MATRIX_HOMESERVER:-}" ]; then
   trap 'kill "$opencode_pid" "$bridge_pid" 2>/dev/null || true' INT TERM EXIT
 
   for _ in $(seq 1 60); do
-    if wget -qO- "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    if wget -T 5 -t 1 -qO- "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
       log "OpenCode API bridge is reachable on port ${PORT}"
       break
     fi
@@ -124,7 +124,7 @@ RUN chmod +x /usr/local/bin/start-opencode-bridge
 EXPOSE 5000 4096
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -qO- "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
+  CMD wget -T 4 -t 1 -qO- "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
 
 ENTRYPOINT ["tini", "--"]
 CMD ["start-opencode-bridge"]
