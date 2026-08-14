@@ -392,7 +392,7 @@ async function main() {
   }
 }
 
-main().catch(() => {
-  logError("Matrix connector terminated")
+main().catch((err) => {
+  logError(`Matrix connector terminated: ${err instanceof Error ? err.message : String(err)}`)
   process.exit(1)
 })
