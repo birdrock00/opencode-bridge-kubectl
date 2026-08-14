@@ -43,7 +43,8 @@ COPY matrix-bot.js /app/matrix-bot.js
 RUN chmod +x /usr/local/bin/kubectl \
     && ansible-playbook --version \
     && ansible-vault --version \
-    && curl -fsSL https://opencode.ai/install | bash \
+    && curl -fsSL https://raw.githubusercontent.com/anomalyco/opencode/v2/install | bash -s -- --no-modify-path \
+    && opencode2 --version \
     && mkdir -p /workspace /data
 
 COPY <<'EOF' /usr/local/bin/start-opencode-bridge
@@ -81,19 +82,33 @@ fi
 
 if [ "${START_OPENCODE_SERVER:-true}" = "true" ]; then
   export OPENCODE_URL="${OPENCODE_URL:-http://127.0.0.1:${OPENCODE_SERVER_PORT}}"
-  log "Starting OpenCode server on ${OPENCODE_SERVER_HOST}:${OPENCODE_SERVER_PORT}"
-  opencode serve --hostname "$OPENCODE_SERVER_HOST" --port "$OPENCODE_SERVER_PORT" &
+  if [ -z "${OPENCODE_PASSWORD:-}" ]; then
+    OPENCODE_PASSWORD="$(node -e 'console.log(require("crypto").randomBytes(16).toString("hex"))')"
+  fi
+  export OPENCODE_PASSWORD
+  export OPENCODE_SERVER_PASSWORD="$OPENCODE_PASSWORD"
+  export OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
+  log "Starting OpenCode V2 server on ${OPENCODE_SERVER_HOST}:${OPENCODE_SERVER_PORT}"
+  opencode2 serve --hostname "$OPENCODE_SERVER_HOST" --port "$OPENCODE_SERVER_PORT" &
   opencode_pid="$!"
 
   trap 'kill "$opencode_pid" 2>/dev/null || true' INT TERM EXIT
 
+  AUTH_B64="$(printf '%s:%s' "$OPENCODE_SERVER_USERNAME" "$OPENCODE_PASSWORD" | base64 | tr -d '\n')"
+  OC_HEALTH_URL="http://127.0.0.1:${OPENCODE_SERVER_PORT}/api/health"
+  healthy=false
   for _ in $(seq 1 60); do
-    if wget -T 5 -t 1 -qO- "$OPENCODE_URL" >/dev/null 2>&1; then
-      log "OpenCode server is reachable at $OPENCODE_URL"
+    if wget -T 5 -t 1 -qO- --header "Authorization: Basic ${AUTH_B64}" "$OC_HEALTH_URL" >/dev/null 2>&1; then
+      healthy=true
       break
     fi
     sleep 1
   done
+  if [ "$healthy" != "true" ]; then
+    log "ERROR: OpenCode server did not become healthy within 60s; aborting"
+    exit 1
+  fi
+  log "OpenCode server is reachable at $OPENCODE_URL"
 fi
 
 cd /app
