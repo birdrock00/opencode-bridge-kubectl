@@ -207,6 +207,9 @@ function messageBody(event) {
 }
 
 async function completeRequest(token, roomId, request, conversationId, model) {
+  // Single, never-edited acknowledgment so a slow request does not look dead.
+  await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
+    .catch(() => logError("failed to post acceptance message"))
   try {
     const answer = await answerWithOpenCode(request, conversationId, model)
     await sendMessage(token, roomId, answer)
