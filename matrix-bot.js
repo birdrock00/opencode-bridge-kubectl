@@ -7,8 +7,6 @@ const MATRIX_PASSWORD = process.env.MATRIX_PASSWORD || ""
 const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN || ""
 const MATRIX_DEVICE_ID = process.env.MATRIX_DEVICE_ID || "OPENCODE_BRIDGE_001"
 const MATRIX_SYNC_TIMEOUT_MS = parseInt(process.env.MATRIX_SYNC_TIMEOUT_MS || "30000", 10)
-const MATRIX_PROGRESS_INTERVAL_MS = parseInt(process.env.MATRIX_PROGRESS_INTERVAL_MS || "60000", 10)
-const MATRIX_TRIGGER = process.env.MATRIX_TRIGGER || "!oc"
 const MATRIX_BOT_NAME = process.env.MATRIX_BOT_NAME || "opencode"
 const MATRIX_ALLOWED_ROOMS = new Set(
   (process.env.MATRIX_ROOM_ID || process.env.MATRIX_ALLOWED_ROOMS || "")
@@ -19,35 +17,6 @@ const MATRIX_ALLOWED_ROOMS = new Set(
 const BRIDGE_URL = (process.env.OPENCODE_BRIDGE_URL || `http://127.0.0.1:${process.env.PORT || "5000"}`).replace(/\/$/, "")
 const OPENCODE_REQUEST_TIMEOUT_MS = parseInt(process.env.OPENCODE_REQUEST_TIMEOUT_MS || "1860000", 10)
 const CHAT_MODEL = process.env.CHAT_MODEL || process.env.DEFAULT_MODEL || "opencode/gpt-5-nano"
-const CHAT_MODEL_ALIASES = parseModelAliases(process.env.CHAT_MODEL_ALIASES || "")
-const roomModels = new Map()
-
-function parseModelAliases(value) {
-  const aliases = new Map()
-  for (const item of value.split(",")) {
-    const [alias, ...modelParts] = item.split("=")
-    const model = modelParts.join("=").trim()
-    if (alias?.trim() && model) aliases.set(alias.trim().toLowerCase(), model)
-  }
-  return aliases
-}
-
-function modelList() {
-  const aliases = [...CHAT_MODEL_ALIASES.entries()]
-    .map(([alias, model]) => `${alias}: ${model}`)
-    .join("\n")
-  return [`default: ${CHAT_MODEL}`, aliases].filter(Boolean).join("\n")
-}
-
-function resolveModel(value) {
-  const key = value.trim().toLowerCase()
-  if (!key || key === "default") return CHAT_MODEL
-  return CHAT_MODEL_ALIASES.get(key) || value.trim()
-}
-
-function selectedModel(roomId) {
-  return roomModels.get(roomId) || CHAT_MODEL
-}
 
 function log(message) {
   console.log(`[MATRIX] ${message}`)
@@ -100,69 +69,21 @@ async function getAccessToken() {
   return data.access_token
 }
 
-async function sendMessage(token, roomId, body, thread = null, replyToEventId = null) {
+// Post a plain text message to the room. No threads, no replies, no edits —
+// each response is just one or more regular messages in the channel.
+async function sendMessage(token, roomId, body) {
   const chunks = body.match(/[\s\S]{1,3500}/g) || [body]
-  let firstEventId = ""
-  let lastEventId = ""
-  let replyTo = replyToEventId || (thread ? thread.rootEventId : null)
-  let isFirst = true
   for (const chunk of chunks) {
-    const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
-    const content = {
-      msgtype: "m.text",
-      body: chunk,
-    }
-    if (thread) {
-      const relatesTo = {
-        rel_type: "m.thread",
-        event_id: thread.rootEventId,
-        "m.in_reply_to": { event_id: replyTo },
-      }
-      if (!isFirst) relatesTo.is_falling_back = true
-      content["m.relates_to"] = relatesTo
-    }
-    const event = await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
+    const txnId = `${Date.now()}-${Math.random().toString(16).slice(4)}`
+    await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
       method: "PUT",
       token,
-      body: JSON.stringify(content),
+      body: JSON.stringify({
+        msgtype: "m.text",
+        body: chunk,
+      }),
     })
-    const eventId = event.event_id || ""
-    firstEventId ||= eventId
-    if (eventId) lastEventId = eventId
-    replyTo = eventId || replyTo
-    isFirst = false
   }
-  return { firstEventId, lastEventId }
-}
-
-async function replaceMessage(token, roomId, eventId, body, thread = null, replyToEventId = null) {
-  if (!eventId) {
-    await sendMessage(token, roomId, body, thread, replyToEventId)
-    return
-  }
-
-  const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
-  await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
-    method: "PUT",
-    token,
-    body: JSON.stringify({
-      msgtype: "m.text",
-      body: `* ${body}`,
-      "m.new_content": { msgtype: "m.text", body },
-      "m.relates_to": { rel_type: "m.replace", event_id: eventId },
-    }),
-  })
-}
-
-function formatElapsed(elapsedMs) {
-  const seconds = Math.floor(elapsedMs / 1000)
-  const minutes = Math.floor(seconds / 60)
-  return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`
-}
-
-function formatProgress(text) {
-  if (text.length <= 3100) return text
-  return `${text.slice(0, 1450)}\n\n... live output truncated ...\n\n${text.slice(-1450)}`
 }
 
 function bridgeConversationId(roomId, event) {
@@ -195,7 +116,7 @@ function requestBridge(path, options = {}) {
   })
 }
 
-function requestBridgeStream(path, options = {}, onProgress) {
+function requestBridgeStream(path, options = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(`${BRIDGE_URL}${path}`)
     const requestFn = url.protocol === "https:" ? httpsRequest : httpRequest
@@ -218,16 +139,13 @@ function requestBridgeStream(path, options = {}, onProgress) {
         buffer = blocks.pop() || ""
         for (const block of blocks) {
           const lines = block.split(/\r?\n/)
-          const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message"
           const dataText = lines
             .filter((line) => line.startsWith("data:"))
             .map((line) => line.slice(5).trimStart())
             .join("\n")
           if (!dataText || dataText === "[DONE]") continue
           const data = JSON.parse(dataText)
-          if (event === "progress") {
-            onProgress(data.text || "")
-          } else if (data.error) {
+          if (data.error) {
             streamError = data.error.message || "OpenCode bridge stream failed"
           } else {
             answer += data.choices?.[0]?.delta?.content || ""
@@ -254,7 +172,7 @@ function requestBridgeStream(path, options = {}, onProgress) {
   })
 }
 
-async function answerWithOpenCode(prompt, conversationId, model, onProgress) {
+async function answerWithOpenCode(prompt, conversationId, model) {
   const response = await requestBridgeStream("/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -271,7 +189,7 @@ async function answerWithOpenCode(prompt, conversationId, model, onProgress) {
         },
       ],
     }),
-  }, onProgress)
+  })
 
   if (!response.ok) {
     throw new Error(`OpenCode bridge failed with HTTP ${response.status}: ${response.text}`)
@@ -279,64 +197,24 @@ async function answerWithOpenCode(prompt, conversationId, model, onProgress) {
   return response.text
 }
 
+// Plain text message bodies count as instructions. Message edits (m.replace)
+// are ignored so editing a previous message never re-triggers a request.
 function messageBody(event) {
   if (event?.type !== "m.room.message") return ""
   if (event?.content?.msgtype !== "m.text") return ""
+  if (event?.content?.["m.relates_to"]?.rel_type === "m.replace") return ""
   return event.content.body || ""
 }
 
-async function completeRequest(token, roomId, request, conversationId, model, statusEventId, lastEventId, thread) {
-  const startedAt = Date.now()
-  let progressUpdate = Promise.resolve()
-  const progress = setInterval(() => {
-    progressUpdate = progressUpdate
-      .then(() => replaceMessage(
-        token,
-        roomId,
-        statusEventId,
-        `Running ${model}; ${formatElapsed(Date.now() - startedAt)} elapsed. I will post the result when it finishes.`,
-        thread,
-        lastEventId,
-      ))
-      .catch(() => logError("failed to update progress status"))
-  }, MATRIX_PROGRESS_INTERVAL_MS)
-
+async function completeRequest(token, roomId, request, conversationId, model) {
   try {
-    const answer = await answerWithOpenCode(request, conversationId, model, (text) => {
-      progressUpdate = progressUpdate
-        .then(async () => {
-          const body = `Live output (${formatElapsed(Date.now() - startedAt)} elapsed):\n${formatProgress(text)}`
-          const sent = await sendMessage(token, roomId, body, thread, lastEventId)
-          if (sent.lastEventId) lastEventId = sent.lastEventId
-        })
-        .catch(() => logError("failed to publish live progress"))
-    })
-    clearInterval(progress)
-    await progressUpdate
-    await replaceMessage(token, roomId, statusEventId, `Completed ${model} after ${formatElapsed(Date.now() - startedAt)}. Posting result.`, thread, lastEventId)
-      .catch(() => logError("failed to update completion status"))
-    await sendMessage(token, roomId, answer, thread, lastEventId)
+    const answer = await answerWithOpenCode(request, conversationId, model)
+    await sendMessage(token, roomId, answer)
+    log("posted OpenCode response")
   } catch {
     logError("OpenCode request failed")
-    clearInterval(progress)
-    await progressUpdate
-    await replaceMessage(token, roomId, statusEventId, `Failed ${model} after ${formatElapsed(Date.now() - startedAt)}.`, thread, lastEventId)
-      .catch(() => logError("failed to update failure status"))
-    await sendMessage(token, roomId, "OpenCode request failed.", thread, lastEventId)
-  } finally {
-    clearInterval(progress)
+    await sendMessage(token, roomId, "OpenCode request failed.")
   }
-}
-
-function threadForEvent(event) {
-  const relatesTo = event.content?.["m.relates_to"]
-  if (relatesTo?.rel_type === "m.thread" && relatesTo.event_id) {
-    return { rootEventId: relatesTo.event_id }
-  }
-  if (event.event_id) {
-    return { rootEventId: event.event_id }
-  }
-  return null
 }
 
 async function handleTimelineEvent(token, roomId, event, ownUserId) {
@@ -344,44 +222,10 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
   if (MATRIX_ALLOWED_ROOMS.size > 0 && !MATRIX_ALLOWED_ROOMS.has(roomId)) return
 
   const body = messageBody(event).trim()
-  if (!body.startsWith(MATRIX_TRIGGER)) return
-
-  const thread = threadForEvent(event)
-  const prompt = body.slice(MATRIX_TRIGGER.length).trim()
-  if (!prompt) {
-    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} <request>\n${MATRIX_TRIGGER} model <alias|model-id>\n${MATRIX_TRIGGER} using <alias|model-id> <request>`, thread, event.event_id)
-    return
-  }
-
-  const modelCommand = prompt.match(/^model(?:\s+(.+))?$/i)
-  if (modelCommand) {
-    const modelName = (modelCommand[1] || "").trim()
-    if (!modelName) {
-      await sendMessage(token, roomId, `Current model: ${selectedModel(roomId)}\n\nAvailable models:\n${modelList()}`, thread, event.event_id)
-      return
-    }
-    const model = resolveModel(modelName)
-    roomModels.set(roomId, model)
-    await sendMessage(token, roomId, `OpenCode model set to ${model}`, thread, event.event_id)
-    return
-  }
-
-  if (/^models$/i.test(prompt)) {
-    await sendMessage(token, roomId, `Available models:\n${modelList()}`, thread, event.event_id)
-    return
-  }
-
-  const usingCommand = prompt.match(/^using\s+(\S+)\s+([\s\S]+)$/i)
-  const model = usingCommand ? resolveModel(usingCommand[1]) : selectedModel(roomId)
-  const request = usingCommand ? usingCommand[2].trim() : prompt
-  if (!request) {
-    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} using <alias|model-id> <request>`, thread, event.event_id)
-    return
-  }
+  if (!body) return
 
   log("handling Matrix request")
-  const status = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`, thread, event.event_id)
-  void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model, status.firstEventId, status.lastEventId, thread)
+  void completeRequest(token, roomId, body, bridgeConversationId(roomId, event), CHAT_MODEL)
     .catch(() => logError("background Matrix request failed"))
 }
 

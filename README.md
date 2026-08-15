@@ -8,8 +8,8 @@ The image can be used in two modes:
 - **API bridge**: exposes `/v1/chat/completions`, `/v1/models`, and `/health`
   while forwarding work to the bundled OpenCode server or an external
   `OPENCODE_URL`.
-- **Matrix bridge**: starts the API bridge internally and responds to Matrix
-  messages beginning with `!oc` by default.
+- **Matrix bridge**: starts the API bridge internally and responds to every
+  text message sent in an allowed room by anyone other than the bot.
 
 The container includes `kubectl`, `git`, `ssh`, and `ansible`; give it only the
 Kubernetes credentials and repository access that its workload needs.
@@ -90,6 +90,12 @@ Do not store private keys in an image or ConfigMap.
 
 ### Matrix Connector
 
+The connector treats **every** `m.text` message sent in an allowed room by
+anyone other than the bot as an instruction for the LLM — there is no trigger
+prefix and no special commands. Message edits are ignored. The bot replies with
+plain text messages directly in the channel (no threads, no per-message status
+editing).
+
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `MATRIX_HOMESERVER` | Matrix mode | Empty | Matrix client-server base URL. |
@@ -98,15 +104,12 @@ Do not store private keys in an image or ConfigMap.
 | `MATRIX_PASSWORD` | Conditional | Empty | Bot password for Matrix login when no access token is provided. |
 | `MATRIX_DEVICE_ID` | No | `OPENCODE_BRIDGE_001` | Device ID used during password login. |
 | `MATRIX_BOT_NAME` | No | `opencode` | Device display name used during password login. |
-| `MATRIX_TRIGGER` | No | `!oc` | Prefix that invokes the bot. |
 | `MATRIX_ROOM_ID` | No | Empty | Comma-separated room allowlist; takes precedence over `MATRIX_ALLOWED_ROOMS`. Empty allows all joined rooms. |
 | `MATRIX_ALLOWED_ROOMS` | No | Empty | Comma-separated room allowlist used when `MATRIX_ROOM_ID` is empty. |
 | `MATRIX_SYNC_TIMEOUT_MS` | No | `30000` | Matrix long-poll sync timeout in milliseconds. |
-| `MATRIX_PROGRESS_INTERVAL_MS` | No | `60000` | Frequency of elapsed-time status updates in milliseconds. |
 | `OPENCODE_BRIDGE_URL` | No | `http://127.0.0.1:${PORT}` | API bridge URL used by the Matrix connector. |
 | `OPENCODE_REQUEST_TIMEOUT_MS` | No | `1860000` | Connector-to-bridge request timeout in milliseconds. |
-| `CHAT_MODEL` | No | `DEFAULT_MODEL`, then `opencode/gpt-5-nano` | Model initially selected for Matrix conversations. |
-| `CHAT_MODEL_ALIASES` | No | Empty | Comma-separated aliases in `alias=model-id` form for Matrix `model`/`using` commands. |
+| `CHAT_MODEL` | No | `DEFAULT_MODEL`, then `opencode/gpt-5-nano` | Model used for Matrix requests. |
 
 ### OpenCode Provider Credentials
 
@@ -131,13 +134,11 @@ MATRIX_ACCESS_TOKEN=YOUR_MATRIX_ACCESS_TOKEN_HERE
 MATRIX_ROOM_ID=!ops_room_10c0c4ad7f47f7d2:matrix.ember-quartz-731.example
 MATRIX_DEVICE_ID=OC_BRIDGE_4F92A1
 MATRIX_BOT_NAME=quartz-opencode-helper
-MATRIX_TRIGGER=!quartz
 
 OPENCODE_SERVER_PASSWORD=YOUR_OPENCODE_SERVER_PASSWORD_HERE
 OPENCODE_PROVIDER_ID=openai
 DEFAULT_MODEL=gpt-4.1-mini
 CHAT_MODEL=openai/gpt-4.1-mini
-CHAT_MODEL_ALIASES=quick=openai/gpt-4.1-mini,deep=openai/o3-mini
 OPENAI_API_KEY=YOUR_OPENAI_API_KEY_HERE
 
 WORKSPACE_DIR=/workspace/project
@@ -239,11 +240,9 @@ data:
   MATRIX_ROOM_ID: "!ops_room_10c0c4ad7f47f7d2:matrix.ember-quartz-731.example"
   MATRIX_DEVICE_ID: "OC_BRIDGE_4F92A1"
   MATRIX_BOT_NAME: "quartz-opencode-helper"
-  MATRIX_TRIGGER: "!quartz"
   OPENCODE_PROVIDER_ID: "openai"
   DEFAULT_MODEL: "gpt-4.1-mini"
   CHAT_MODEL: "openai/gpt-4.1-mini"
-  CHAT_MODEL_ALIASES: "quick=openai/gpt-4.1-mini,deep=openai/o3-mini"
   WORKSPACE_DIR: "/workspace/project"
   GIT_REPO_URL: "https://github.com/lantern-sable-482/sample-infra-playground.git"
   GIT_CLONE_DEPTH: "1"
