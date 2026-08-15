@@ -100,27 +100,44 @@ async function getAccessToken() {
   return data.access_token
 }
 
-async function sendMessage(token, roomId, body) {
+async function sendMessage(token, roomId, body, thread = null, replyToEventId = null) {
   const chunks = body.match(/[\s\S]{1,3500}/g) || [body]
   let firstEventId = ""
+  let lastEventId = ""
+  let replyTo = replyToEventId || (thread ? thread.rootEventId : null)
+  let isFirst = true
   for (const chunk of chunks) {
     const txnId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const content = {
+      msgtype: "m.text",
+      body: chunk,
+    }
+    if (thread) {
+      const relatesTo = {
+        rel_type: "m.thread",
+        event_id: thread.rootEventId,
+        "m.in_reply_to": { event_id: replyTo },
+      }
+      if (!isFirst) relatesTo.is_falling_back = true
+      content["m.relates_to"] = relatesTo
+    }
     const event = await matrixFetch(`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
       method: "PUT",
       token,
-      body: JSON.stringify({
-        msgtype: "m.text",
-        body: chunk,
-      }),
+      body: JSON.stringify(content),
     })
-    firstEventId ||= event.event_id || ""
+    const eventId = event.event_id || ""
+    firstEventId ||= eventId
+    if (eventId) lastEventId = eventId
+    replyTo = eventId || replyTo
+    isFirst = false
   }
-  return firstEventId
+  return { firstEventId, lastEventId }
 }
 
-async function replaceMessage(token, roomId, eventId, body) {
+async function replaceMessage(token, roomId, eventId, body, thread = null, replyToEventId = null) {
   if (!eventId) {
-    await sendMessage(token, roomId, body)
+    await sendMessage(token, roomId, body, thread, replyToEventId)
     return
   }
 
@@ -268,7 +285,7 @@ function messageBody(event) {
   return event.content.body || ""
 }
 
-async function completeRequest(token, roomId, request, conversationId, model, statusEventId) {
+async function completeRequest(token, roomId, request, conversationId, model, statusEventId, lastEventId, thread) {
   const startedAt = Date.now()
   let progressUpdate = Promise.resolve()
   const progress = setInterval(() => {
@@ -278,6 +295,8 @@ async function completeRequest(token, roomId, request, conversationId, model, st
         roomId,
         statusEventId,
         `Running ${model}; ${formatElapsed(Date.now() - startedAt)} elapsed. I will post the result when it finishes.`,
+        thread,
+        lastEventId,
       ))
       .catch(() => logError("failed to update progress status"))
   }, MATRIX_PROGRESS_INTERVAL_MS)
@@ -287,25 +306,37 @@ async function completeRequest(token, roomId, request, conversationId, model, st
       progressUpdate = progressUpdate
         .then(async () => {
           const body = `Live output (${formatElapsed(Date.now() - startedAt)} elapsed):\n${formatProgress(text)}`
-          await sendMessage(token, roomId, body)
+          const sent = await sendMessage(token, roomId, body, thread, lastEventId)
+          if (sent.lastEventId) lastEventId = sent.lastEventId
         })
         .catch(() => logError("failed to publish live progress"))
     })
     clearInterval(progress)
     await progressUpdate
-    await replaceMessage(token, roomId, statusEventId, `Completed ${model} after ${formatElapsed(Date.now() - startedAt)}. Posting result.`)
+    await replaceMessage(token, roomId, statusEventId, `Completed ${model} after ${formatElapsed(Date.now() - startedAt)}. Posting result.`, thread, lastEventId)
       .catch(() => logError("failed to update completion status"))
-    await sendMessage(token, roomId, answer)
+    await sendMessage(token, roomId, answer, thread, lastEventId)
   } catch {
     logError("OpenCode request failed")
     clearInterval(progress)
     await progressUpdate
-    await replaceMessage(token, roomId, statusEventId, `Failed ${model} after ${formatElapsed(Date.now() - startedAt)}.`)
+    await replaceMessage(token, roomId, statusEventId, `Failed ${model} after ${formatElapsed(Date.now() - startedAt)}.`, thread, lastEventId)
       .catch(() => logError("failed to update failure status"))
-    await sendMessage(token, roomId, "OpenCode request failed.")
+    await sendMessage(token, roomId, "OpenCode request failed.", thread, lastEventId)
   } finally {
     clearInterval(progress)
   }
+}
+
+function threadForEvent(event) {
+  const relatesTo = event.content?.["m.relates_to"]
+  if (relatesTo?.rel_type === "m.thread" && relatesTo.event_id) {
+    return { rootEventId: relatesTo.event_id }
+  }
+  if (event.event_id) {
+    return { rootEventId: event.event_id }
+  }
+  return null
 }
 
 async function handleTimelineEvent(token, roomId, event, ownUserId) {
@@ -315,9 +346,10 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
   const body = messageBody(event).trim()
   if (!body.startsWith(MATRIX_TRIGGER)) return
 
+  const thread = threadForEvent(event)
   const prompt = body.slice(MATRIX_TRIGGER.length).trim()
   if (!prompt) {
-    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} <request>\n${MATRIX_TRIGGER} model <alias|model-id>\n${MATRIX_TRIGGER} using <alias|model-id> <request>`)
+    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} <request>\n${MATRIX_TRIGGER} model <alias|model-id>\n${MATRIX_TRIGGER} using <alias|model-id> <request>`, thread, event.event_id)
     return
   }
 
@@ -325,17 +357,17 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
   if (modelCommand) {
     const modelName = (modelCommand[1] || "").trim()
     if (!modelName) {
-      await sendMessage(token, roomId, `Current model: ${selectedModel(roomId)}\n\nAvailable models:\n${modelList()}`)
+      await sendMessage(token, roomId, `Current model: ${selectedModel(roomId)}\n\nAvailable models:\n${modelList()}`, thread, event.event_id)
       return
     }
     const model = resolveModel(modelName)
     roomModels.set(roomId, model)
-    await sendMessage(token, roomId, `OpenCode model set to ${model}`)
+    await sendMessage(token, roomId, `OpenCode model set to ${model}`, thread, event.event_id)
     return
   }
 
   if (/^models$/i.test(prompt)) {
-    await sendMessage(token, roomId, `Available models:\n${modelList()}`)
+    await sendMessage(token, roomId, `Available models:\n${modelList()}`, thread, event.event_id)
     return
   }
 
@@ -343,14 +375,13 @@ async function handleTimelineEvent(token, roomId, event, ownUserId) {
   const model = usingCommand ? resolveModel(usingCommand[1]) : selectedModel(roomId)
   const request = usingCommand ? usingCommand[2].trim() : prompt
   if (!request) {
-    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} using <alias|model-id> <request>`)
+    await sendMessage(token, roomId, `Usage: ${MATRIX_TRIGGER} using <alias|model-id> <request>`, thread, event.event_id)
     return
   }
 
   log("handling Matrix request")
-  let statusEventId
-  statusEventId = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`)
-  void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model, statusEventId)
+  const status = await sendMessage(token, roomId, `Accepted. Running ${model}; I will post the result when it finishes.`, thread, event.event_id)
+  void completeRequest(token, roomId, request, bridgeConversationId(roomId, event), model, status.firstEventId, status.lastEventId, thread)
     .catch(() => logError("background Matrix request failed"))
 }
 
